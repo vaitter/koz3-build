@@ -386,7 +386,7 @@ def process_region(model, region_dir, tmp_root, region_name):
         geo_tifs.extend(region_dir.rglob(pat))
     geo_tifs = list(dict.fromkeys(geo_tifs))
     print(f"  [DEBUG] geo_tifs={len(geo_tifs)}, _E2_MODEL={_E2_MODEL is not None}")
-    if geo_tifs and _E2_MODEL is not None:
+    if False and geo_tifs and _E2_MODEL is not None:  # E2 ОТКЛЮЧЁН
         e2 = _E2_MODEL
         print(f"  [{region_name}] E2: {len(geo_tifs)} .tif")
         for tif in geo_tifs[:1]:
