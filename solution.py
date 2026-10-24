@@ -344,6 +344,11 @@ def process_region(model, region_dir, tmp_root, region_name):
                             if area_utm < MIN_AREA_M2: continue
                             geom_json = mapping(g_3857)
                             if not geom_json.get("coordinates"): continue
+                            # Проверка на NaN/Inf в координатах
+                            import math as _m
+                            coords_str = json.dumps(geom_json["coordinates"])
+                            if "NaN" in coords_str or "Infinity" in coords_str:
+                                continue
                             features.append({
                                 "type": "Feature",
                                 "properties": {
@@ -455,6 +460,12 @@ def process_region(model, region_dir, tmp_root, region_name):
                                             },
                                             "geometry": mapping(g_3857_2),
                                         })
+                                        # Проверка на NaN
+                                        import math as _m
+                                        _cs = json.dumps(features[-1]["geometry"]["coordinates"])
+                                        if "NaN" in _cs or "Infinity" in _cs:
+                                            features.pop()
+                                            continue
                                     except Exception:
                                         continue
             except Exception as e:
