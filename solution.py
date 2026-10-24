@@ -28,6 +28,8 @@ from ultralytics import YOLO
 # ===== Константы =====
 CLASS_NAMES = ["kurgany_tselye", "kurgany_povrezhdennye", "fortifikatsii",
                "gorodishcha", "arkhitektury"]
+E2_CLASS_NAMES = ["finds_points", "object_poly"]
+_E2_MODEL = None  # global E2 model
 TILE = 1024
 OVERLAP = 0.3
 STRIDE = int(TILE * (1 - OVERLAP))
@@ -269,23 +271,23 @@ def load_utm_epsg(region_dir):
 
 def process_region(model, region_dir, tmp_root, region_name):
     las = find_las(region_dir)
-    if las is None:
-        print(f"  [{region_name}] нет LAS, пропуск")
-        return []
-    epsg = load_utm_epsg(region_dir)
-    t_utm_3857 = Transformer.from_crs(epsg, 3857, always_xy=True)
-
-    print(f"  [{region_name}] LAS={las.name}, EPSG={epsg}")
-    t0 = time.time()
-    g_tif, g_tf = build_g_from_las(las, tmp_root, res=HS_RES)
-    print(f"  [{region_name}] g построен за {time.time()-t0:.1f}с")
-    with rasterio.open(g_tif) as _s:
-        print(f"  [{region_name}] g shape: {_s.height}x{_s.width}, res={abs(_s.transform.a):.4f}")
-
     features = []
-    with rasterio.open(g_tif) as src:
-        data = src.read(1)
-        H, W = data.shape
+    n_tiles = 0
+
+    # E1 (LAS) — если есть LAS
+    if las is not None:
+        epsg = load_utm_epsg(region_dir)
+        t_utm_3857 = Transformer.from_crs(epsg, 3857, always_xy=True)
+        print(f"  [{region_name}] LAS={las.name}, EPSG={epsg}")
+        t0 = time.time()
+        g_tif, g_tf = build_g_from_las(las, tmp_root, res=HS_RES)
+        print(f"  [{region_name}] g построен за {time.time()-t0:.1f}с")
+        with rasterio.open(g_tif) as _s:
+            print(f"  [{region_name}] g shape: {_s.height}x{_s.width}, res={abs(_s.transform.a):.4f}")
+
+        with rasterio.open(g_tif) as src:
+            data = src.read(1)
+            H, W = data.shape
     # Переводим в 3-канальный
     img = np.repeat(data[..., None], 3, axis=-1)
     tf = g_tf
@@ -372,7 +374,92 @@ def process_region(model, region_dir, tmp_root, region_name):
                         })
                     except Exception as e:
                         continue
-    print(f"  [{region_name}] тайлов: {n_tiles}, фич: {len(features)}")
+    
+    # ===== E2: геофизика (mag/et/ter .tif) =====
+    geo_tifs = []
+    for pat in ("*maggr*.tif", "*etgr*.tif", "*terfl*.tif",
+                "*MagGr*.tif", "*EtGr*.tif", "*TerFl*.tif"):
+        geo_tifs.extend(region_dir.rglob(pat))
+    geo_tifs = list(dict.fromkeys(geo_tifs))
+    if geo_tifs and _E2_MODEL is not None:
+        e2 = _E2_MODEL
+        print(f"  [{region_name}] E2: {len(geo_tifs)} .tif")
+        for tif in geo_tifs[:1]:
+            try:
+                with rasterio.open(tif) as src_e2:
+                    W2, H2, tf2 = src_e2.width, src_e2.height, src_e2.transform
+                    crs2 = src_e2.crs
+                    if W2 < 512 or H2 < 512:
+                        continue
+                    data2 = src_e2.read()
+                    if data2.shape[0] >= 4:
+                        data2 = data2[:3]
+                    elif data2.shape[0] == 1:
+                        data2 = np.repeat(data2, 3, axis=0)
+                    img2 = data2[:3].transpose(1, 2, 0)
+                    t_utm_3857_e2 = Transformer.from_crs(crs2, 3857, always_xy=True)
+                    for y2 in range(0, H2 - 512 + 1, 358):
+                        for x2 in range(0, W2 - 512 + 1, 358):
+                            tile2 = img2[y2:y2+512, x2:x2+512]
+                            if tile2.shape[0] < 512 or tile2.shape[1] < 512: continue
+                            tile2_bgr = np.ascontiguousarray(cv2.cvtColor(tile2, cv2.COLOR_RGB2BGR))
+                            r2 = e2.predict(source=tile2_bgr, conf=0.25, iou=0.5, verbose=False)[0]
+                            if r2.masks is None or r2.boxes is None: continue
+                            m2_data = r2.masks.data.cpu().numpy()
+                            oh2, ow2 = r2.masks.orig_shape
+                            c2 = r2.boxes.cls.cpu().numpy()
+                            cf2 = r2.boxes.conf.cpu().numpy()
+                            tf2_tile = rasterio.windows.transform(
+                                Window(x2, y2, min(512, W2-x2), min(512, H2-y2)), tf2)
+                            for idx2, raw2 in enumerate(m2_data):
+                                m2 = raw2
+                                if m2.shape != (oh2, ow2):
+                                    m2 = cv2.resize(m2, (ow2, oh2), interpolation=cv2.INTER_NEAREST)
+                                bin2 = m2 > MASK_THRESHOLD
+                                hl2, wl2 = min(oh2, 512), min(ow2, 512)
+                                if not bin2[:hl2, :wl2].any(): continue
+                                full2 = np.zeros((512, 512), np.uint8)
+                                full2[:hl2, :wl2] = bin2[:hl2, :wl2].astype(np.uint8)
+                                cid2 = int(c2[idx2]) if idx2 < len(c2) else 0
+                                if cid2 >= len(E2_CLASS_NAMES): continue
+                                cname2 = E2_CLASS_NAMES[cid2]
+                                cconf2 = float(cf2[idx2]) if idx2 < len(cf2) else 0.5
+                                for poly2 in mask_to_polygons(full2):
+                                    try:
+                                        g_utm2 = shp_transform(
+                                            lambda px, py, z=None: (
+                                                tf2_tile.c + px*tf2_tile.a + py*tf2_tile.b,
+                                                tf2_tile.f + px*tf2_tile.d + py*tf2_tile.e),
+                                            poly2)
+                                        g_3857_2 = shp_transform(t_utm_3857_e2.transform, g_utm2)
+                                        g_3857_2 = make_valid(g_3857_2)
+                                        if g_3857_2.is_empty: continue
+                                        if g_3857_2.geom_type not in ("Polygon", "MultiPolygon"):
+                                            parts2 = [gg for gg in g_3857_2.geoms
+                                                     if gg.geom_type in ("Polygon", "MultiPolygon")]
+                                            if not parts2: continue
+                                            g_3857_2 = unary_union(parts2)
+                                        g_3857_2 = g_3857_2.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
+                                        if g_3857_2.is_empty: continue
+                                        features.append({
+                                            "type": "Feature",
+                                            "properties": {
+                                                "class_name": cname2,
+                                                "region_name": region_name,
+                                                "markup_type": "maggr",
+                                                "crs": "urn:ogc:def:crs:EPSG::3857",
+                                                "original_crs": f"urn:ogc:def:crs:EPSG::{crs2}",
+                                                "confidence": round(cconf2, 3),
+                                                "fid": 0,
+                                            },
+                                            "geometry": mapping(g_3857_2),
+                                        })
+                                    except Exception:
+                                        continue
+            except Exception as e:
+                print(f"  [{region_name}] E2 {tif.name}: {e}")
+
+    print(f"  [{region_name}] тайлов E1: {n_tiles}, фич всего: {len(features)}")
     return features
 
 def dedup(features, thr=DEDUP_IOU):
@@ -417,6 +504,18 @@ def main():
     print(f"Загрузка модели {model_path}...")
     model = YOLO(str(model_path))
     print(f"Классы модели: {model.names}")
+    global _E2_MODEL
+    e2_path = Path(__file__).parent / "best_e2.pt"
+    if e2_path.exists():
+        print(f"Загрузка E2: {e2_path}")
+        try:
+            _E2_MODEL = YOLO(str(e2_path))
+            print(f"E2 classes: {_E2_MODEL.names}")
+        except Exception as e:
+            print(f"E2 не загружен: {e}")
+    else:
+        print(f"⚠️ E2 не найден: {e2_path}")
+
 
     regions = sorted(d for d in input_path.iterdir() if d.is_dir() and not d.name.startswith("."))
     if not regions:
