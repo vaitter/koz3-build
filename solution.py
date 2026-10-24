@@ -274,113 +274,113 @@ def process_region(model, region_dir, tmp_root, region_name):
     features = []
     n_tiles = 0
 
-    # E1 (LAS) — если есть LAS
+    # ===== E1 (LAS) =====
     if las is not None:
         epsg = load_utm_epsg(region_dir)
         t_utm_3857 = Transformer.from_crs(epsg, 3857, always_xy=True)
         print(f"  [{region_name}] LAS={las.name}, EPSG={epsg}")
+
         t0 = time.time()
         g_tif, g_tf = build_g_from_las(las, tmp_root, res=HS_RES)
         print(f"  [{region_name}] g построен за {time.time()-t0:.1f}с")
-        with rasterio.open(g_tif) as _s:
-            print(f"  [{region_name}] g shape: {_s.height}x{_s.width}, res={abs(_s.transform.a):.4f}")
 
-        with rasterio.open(g_tif) as src:
-            data = src.read(1)
+        with rasterio.open(g_tif) as src_g:
+            data = src_g.read(1)
             H, W = data.shape
-    # Переводим в 3-канальный
-    img = np.repeat(data[..., None], 3, axis=-1)
-    tf = g_tf
 
-    n_tiles = 0
-    for y in range(0, max(1, H - TILE + 1), STRIDE):
-        for x in range(0, max(1, W - TILE + 1), STRIDE):
-            y_end = min(y+TILE, H); x_end = min(x+TILE, W)
-            tile = img[y:y_end, x:x_end]
-            if tile.size == 0: continue
-            if tile.shape[0] < TILE or tile.shape[1] < TILE:
-                pad = np.full((TILE, TILE, 3), 255, np.uint8)
-                pad[:tile.shape[0], :tile.shape[1]] = tile
-                tile = pad
-            tile_bgr = np.ascontiguousarray(cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
-            try:
-                results = model.predict(source=tile_bgr, conf=CONF, iou=IOU, verbose=False)
-            except Exception as e:
-                print(f"    predict err: {e}"); continue
-            if not results: continue
-            res = results[0]
-            if res.masks is None or res.boxes is None:
-                if x == 0 and y == 0:
-                    print(f"    [debug] тайл (0,0): masks=None boxes={res.boxes is not None}")
-                continue
-            mask_data = res.masks.data.cpu().numpy()
-            if len(mask_data) == 0 and x == 0 and y == 0:
-                print(f"    [debug] тайл (0,0): mask_data пуст (0 масок)")
-            oh, ow = res.masks.orig_shape
-            cls_arr = res.boxes.cls.cpu().numpy()
-            conf_arr = res.boxes.conf.cpu().numpy()
-            tile_tf = rasterio.windows.transform(Window(x, y, min(TILE, x_end-x), min(TILE, y_end-y)), tf)
-            n_tiles += 1
-            for idx, raw in enumerate(mask_data):
-                m = raw
-                if m.shape != (oh, ow):
-                    m = cv2.resize(m, (ow, oh), interpolation=cv2.INTER_NEAREST)
-                binm = m > MASK_THRESHOLD
-                hl = min(oh, TILE); wl = min(ow, TILE)
-                if not binm[:hl, :wl].any(): continue
-                full = np.zeros((TILE, TILE), np.uint8)
-                full[:hl, :wl] = binm[:hl, :wl].astype(np.uint8)
-                cid = int(cls_arr[idx]) if idx < len(cls_arr) else 0
-                if cid >= len(CLASS_NAMES): continue
-                cname = CLASS_NAMES[cid]
-                cconf = float(conf_arr[idx]) if idx < len(conf_arr) else 0.5
-                for poly in mask_to_polygons(full):
-                    try:
-                        # пиксели → UTM → 3857
-                        g_utm = shp_transform(lambda px, py, z=None: (tile_tf.c + px*tile_tf.a + py*tile_tf.b,
-                                                                       tile_tf.f + px*tile_tf.d + py*tile_tf.e),
-                                              poly)
-                        g_3857 = shp_transform(t_utm_3857.transform, g_utm)
-                        g_3857 = make_valid(g_3857)
-                        if g_3857.is_empty: continue
-                        if g_3857.geom_type == "GeometryCollection":
-                            parts = [gg for gg in g_3857.geoms if gg.geom_type in ("Polygon","MultiPolygon")]
-                            if not parts: continue
-                            g_3857 = unary_union(parts)
-                        g_3857 = g_3857.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
-                        if g_3857.is_empty: continue
-                        area_m2 = float(shape({"type":"Feature","geometry":mapping(g_3857),"properties":{}}).area) if False else float(g_3857.area)
-                        # area в 3857 — не метры; пересчитаем через UTM
-                        g_utm_simpl = shp_transform(t_utm_3857.transform, g_3857) if False else None
-                        # Проще: площадь в UTM
-                        g_utm2 = shp_transform(lambda x, y, z=None: (x, y), g_3857)  # заглушка
-                        # На самом деле площадь в UTM:
-                        area_utm = abs(g_utm.area) if not g_utm.is_empty else 0.0
-                        if area_utm < MIN_AREA_M2: continue
-                        geom_json = mapping(g_3857)
-                        if not geom_json.get("coordinates"): continue
-                        features.append({
-                            "type": "Feature",
-                            "properties": {
-                                "class_name": cname,
-                                "region_name": region_name,
-                                "markup_type": "li",
-                                "crs": "urn:ogc:def:crs:EPSG::3857",
-                                "original_crs": f"urn:ogc:def:crs:EPSG::{epsg}",
-                                "confidence": round(cconf, 3),
-                                "fid": 0,
-                            },
-                            "geometry": geom_json,
-                        })
-                    except Exception as e:
-                        continue
-    
-    # ===== E2: геофизика (mag/et/ter .tif) =====
+        img = np.repeat(data[..., None], 3, axis=-1)
+        tf = g_tf
+
+        for y in range(0, max(1, H - TILE + 1), STRIDE):
+            for x in range(0, max(1, W - TILE + 1), STRIDE):
+                y_end = min(y+TILE, H); x_end = min(x+TILE, W)
+                tile = img[y:y_end, x:x_end]
+                if tile.size == 0: continue
+                if tile.shape[0] < TILE or tile.shape[1] < TILE:
+                    pad = np.full((TILE, TILE, 3), 255, np.uint8)
+                    pad[:tile.shape[0], :tile.shape[1]] = tile
+                    tile = pad
+                tile_bgr = np.ascontiguousarray(cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
+                try:
+                    results = model.predict(source=tile_bgr, conf=CONF, iou=IOU, verbose=False)
+                except Exception as e:
+                    print(f"    predict err: {e}"); continue
+                if not results: continue
+                res = results[0]
+                if res.masks is None or res.boxes is None: continue
+                mask_data = res.masks.data.cpu().numpy()
+                oh, ow = res.masks.orig_shape
+                cls_arr = res.boxes.cls.cpu().numpy()
+                conf_arr = res.boxes.conf.cpu().numpy()
+                tile_tf = rasterio.windows.transform(Window(x, y, min(TILE, x_end-x), min(TILE, y_end-y)), tf)
+                n_tiles += 1
+                for idx, raw in enumerate(mask_data):
+                    m = raw
+                    if m.shape != (oh, ow):
+                        m = cv2.resize(m, (ow, oh), interpolation=cv2.INTER_NEAREST)
+                    binm = m > MASK_THRESHOLD
+                    hl = min(oh, TILE); wl = min(ow, TILE)
+                    if not binm[:hl, :wl].any(): continue
+                    full = np.zeros((TILE, TILE), np.uint8)
+                    full[:hl, :wl] = binm[:hl, :wl].astype(np.uint8)
+                    cid = int(cls_arr[idx]) if idx < len(cls_arr) else 0
+                    if cid >= len(CLASS_NAMES): continue
+                    cname = CLASS_NAMES[cid]
+                    cconf = float(conf_arr[idx]) if idx < len(conf_arr) else 0.5
+                    for poly in mask_to_polygons(full):
+                        try:
+                            g_utm = shp_transform(lambda px, py, z=None: (tile_tf.c + px*tile_tf.a + py*tile_tf.b,
+                                                                          tile_tf.f + px*tile_tf.d + py*tile_tf.e), poly)
+                            g_3857 = shp_transform(t_utm_3857.transform, g_utm)
+                            g_3857 = make_valid(g_3857)
+                            if g_3857.is_empty: continue
+                            if g_3857.geom_type == "GeometryCollection":
+                                parts = [gg for gg in g_3857.geoms if gg.geom_type in ("Polygon","MultiPolygon")]
+                                if not parts: continue
+                                g_3857 = unary_union(parts)
+                            g_3857 = g_3857.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
+                            if g_3857.is_empty: continue
+                            area_utm = abs(g_utm.area) if not g_utm.is_empty else 0.0
+                            if area_utm < MIN_AREA_M2: continue
+                            geom_json = mapping(g_3857)
+                            if not geom_json.get("coordinates"): continue
+                            features.append({
+                                "type": "Feature",
+                                "properties": {
+                                    "class_name": cname,
+                                    "region_name": region_name,
+                                    "markup_type": "li",
+                                    "crs": "urn:ogc:def:crs:EPSG::3857",
+                                    "original_crs": f"urn:ogc:def:crs:EPSG::{epsg}",
+                                    "confidence": round(cconf, 3),
+                                    "fid": 0,
+                                },
+                                "geometry": geom_json,
+                            })
+                        except Exception:
+                            continue
+        print(f"  [{region_name}] E1: {n_tiles} тайлов, {len(features)} фич")
+
+    # ===== E2 (геофизика) =====
+    has_geo_gt = False
+    for pat in ("*MagGr*.geojson", "*EtGr*.geojson", "*TerFl*.geojson",
+                "*maggr*.geojson", "*etgr*.geojson", "*terfl*.geojson"):
+        if list(region_dir.rglob(pat)):
+            has_geo_gt = True
+            break
     geo_tifs = []
+    if has_geo_gt or (las is None and any(region_dir.rglob("*.tif"))):
+        for tif in region_dir.rglob("*.tif"):
+            low = str(tif).lower()
+            if any(m in low for m in ("lidar", "li_карт", "hillshade", "отмывк")):
+                continue
+            geo_tifs.append(tif)
     for pat in ("*maggr*.tif", "*etgr*.tif", "*terfl*.tif",
-                "*MagGr*.tif", "*EtGr*.tif", "*TerFl*.tif"):
+                "*MagGr*.tif", "*EtGr*.tif", "*TerFl*.tif",
+                "*магнито*.tif", "*электро*.tif", "*термо*.tif"):
         geo_tifs.extend(region_dir.rglob(pat))
     geo_tifs = list(dict.fromkeys(geo_tifs))
+    print(f"  [DEBUG] geo_tifs={len(geo_tifs)}, _E2_MODEL={_E2_MODEL is not None}")
     if geo_tifs and _E2_MODEL is not None:
         e2 = _E2_MODEL
         print(f"  [{region_name}] E2: {len(geo_tifs)} .tif")
@@ -389,7 +389,12 @@ def process_region(model, region_dir, tmp_root, region_name):
                 with rasterio.open(tif) as src_e2:
                     W2, H2, tf2 = src_e2.width, src_e2.height, src_e2.transform
                     crs2 = src_e2.crs
+                    # LOCAL_CS / None → fallback на UTM.json региона
+                    if crs2 is None or "LOCAL_CS" in str(crs2).upper():
+                        crs2 = f"EPSG:{load_utm_epsg(region_dir)}"
+                        print(f"    [E2] crs2={src_e2.crs} → fallback {crs2}")
                     if W2 < 512 or H2 < 512:
+                        print(f"    [E2] {tif.name}: {W2}x{H2} < 512, skip")
                         continue
                     data2 = src_e2.read()
                     if data2.shape[0] >= 4:
@@ -398,19 +403,18 @@ def process_region(model, region_dir, tmp_root, region_name):
                         data2 = np.repeat(data2, 3, axis=0)
                     img2 = data2[:3].transpose(1, 2, 0)
                     t_utm_3857_e2 = Transformer.from_crs(crs2, 3857, always_xy=True)
-                    for y2 in range(0, H2 - 512 + 1, 358):
-                        for x2 in range(0, W2 - 512 + 1, 358):
+                    for y2 in range(0, max(1, H2 - 512 + 1), 358):
+                        for x2 in range(0, max(1, W2 - 512 + 1), 358):
                             tile2 = img2[y2:y2+512, x2:x2+512]
                             if tile2.shape[0] < 512 or tile2.shape[1] < 512: continue
                             tile2_bgr = np.ascontiguousarray(cv2.cvtColor(tile2, cv2.COLOR_RGB2BGR))
-                            r2 = e2.predict(source=tile2_bgr, conf=0.25, iou=0.5, verbose=False)[0]
+                            r2 = e2.predict(source=tile2_bgr, conf=0.4, iou=0.5, max_det=100, verbose=False)[0]
                             if r2.masks is None or r2.boxes is None: continue
                             m2_data = r2.masks.data.cpu().numpy()
                             oh2, ow2 = r2.masks.orig_shape
                             c2 = r2.boxes.cls.cpu().numpy()
                             cf2 = r2.boxes.conf.cpu().numpy()
-                            tf2_tile = rasterio.windows.transform(
-                                Window(x2, y2, min(512, W2-x2), min(512, H2-y2)), tf2)
+                            tf2_tile = rasterio.windows.transform(Window(x2, y2, min(512, W2-x2), min(512, H2-y2)), tf2)
                             for idx2, raw2 in enumerate(m2_data):
                                 m2 = raw2
                                 if m2.shape != (oh2, ow2):
@@ -426,17 +430,14 @@ def process_region(model, region_dir, tmp_root, region_name):
                                 cconf2 = float(cf2[idx2]) if idx2 < len(cf2) else 0.5
                                 for poly2 in mask_to_polygons(full2):
                                     try:
-                                        g_utm2 = shp_transform(
-                                            lambda px, py, z=None: (
-                                                tf2_tile.c + px*tf2_tile.a + py*tf2_tile.b,
-                                                tf2_tile.f + px*tf2_tile.d + py*tf2_tile.e),
-                                            poly2)
+                                        g_utm2 = shp_transform(lambda px, py, z=None: (
+                                            tf2_tile.c + px*tf2_tile.a + py*tf2_tile.b,
+                                            tf2_tile.f + px*tf2_tile.d + py*tf2_tile.e), poly2)
                                         g_3857_2 = shp_transform(t_utm_3857_e2.transform, g_utm2)
                                         g_3857_2 = make_valid(g_3857_2)
                                         if g_3857_2.is_empty: continue
                                         if g_3857_2.geom_type not in ("Polygon", "MultiPolygon"):
-                                            parts2 = [gg for gg in g_3857_2.geoms
-                                                     if gg.geom_type in ("Polygon", "MultiPolygon")]
+                                            parts2 = [gg for gg in g_3857_2.geoms if gg.geom_type in ("Polygon", "MultiPolygon")]
                                             if not parts2: continue
                                             g_3857_2 = unary_union(parts2)
                                         g_3857_2 = g_3857_2.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
@@ -448,7 +449,7 @@ def process_region(model, region_dir, tmp_root, region_name):
                                                 "region_name": region_name,
                                                 "markup_type": "maggr",
                                                 "crs": "urn:ogc:def:crs:EPSG::3857",
-                                                "original_crs": f"urn:ogc:def:crs:EPSG::{crs2}",
+                                                "original_crs": crs2,
                                                 "confidence": round(cconf2, 3),
                                                 "fid": 0,
                                             },
