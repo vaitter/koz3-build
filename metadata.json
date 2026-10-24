@@ -1,0 +1,4 @@
+{
+  "image": "vaitter/koz3-e1:v1",
+  "entry_point": "python solution.py"
+}
