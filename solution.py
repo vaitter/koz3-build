@@ -8,7 +8,7 @@ solution.py — инференс для КОЗ-3 (E1: рельеф).
 - properties: class_name, region_name, markup_type="li", crs, confidence, fid
 - дедуп (IoU 0.95) + фильтр площади (1 м²)
 """
-import argparse, json, os, sys, time, struct, math, warnings
+import argparse, os, json, os, sys, time, struct, math, warnings
 from pathlib import Path
 from collections import defaultdict
 
@@ -233,6 +233,8 @@ def build_g_from_las(las_path, out_dir, res=0.20):
 def mask_to_polygons(mask, max_polys=MAX_CONTOURS_PER_MASK):
     m = (mask > 0).astype(np.uint8)
     cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(cnts) > 0 and os.environ.get("DEBUG_E2"):
+        print(f"    [mask_to_polygons] контуров: {len(cnts)}, max_area={max(cv2.contourArea(c) for c in cnts):.1f}")
     n = 0
     for c in cnts:
         if n >= max_polys: break
@@ -374,10 +376,13 @@ def process_region(model, region_dir, tmp_root, region_name):
             has_geo_gt = True
             break
     geo_tifs = []
+    # Только MagGr/EtGr/TerFl (по имени файла или папки)
     if has_geo_gt or (las is None and any(region_dir.rglob("*.tif"))):
         for tif in region_dir.rglob("*.tif"):
             low = str(tif).lower()
-            if any(m in low for m in ("lidar", "li_карт", "hillshade", "отмывк")):
+            parent_low = str(tif.parent).lower()
+            if not any(m in low or m in parent_low for m in
+                       ("maggr", "etgr", "terfl", "магнито", "электро", "термо")):
                 continue
             geo_tifs.append(tif)
     for pat in ("*maggr*.tif", "*etgr*.tif", "*terfl*.tif",
@@ -386,7 +391,7 @@ def process_region(model, region_dir, tmp_root, region_name):
         geo_tifs.extend(region_dir.rglob(pat))
     geo_tifs = list(dict.fromkeys(geo_tifs))
     print(f"  [DEBUG] geo_tifs={len(geo_tifs)}, _E2_MODEL={_E2_MODEL is not None}")
-    if False and geo_tifs and _E2_MODEL is not None:  # E2 ОТКЛЮЧЁН
+    if geo_tifs and _E2_MODEL is not None:
         e2 = _E2_MODEL
         print(f"  [{region_name}] E2: {len(geo_tifs)} .tif")
         for tif in geo_tifs[:1]:
@@ -394,13 +399,17 @@ def process_region(model, region_dir, tmp_root, region_name):
                 with rasterio.open(tif) as src_e2:
                     W2, H2, tf2 = src_e2.width, src_e2.height, src_e2.transform
                     crs2 = src_e2.crs
-                    # LOCAL_CS / None → fallback на UTM.json региона
+                    # Приводим к строке (CRS → "EPSG:xxxx" или WKT)
                     if crs2 is None or "LOCAL_CS" in str(crs2).upper():
                         crs2 = f"EPSG:{load_utm_epsg(region_dir)}"
                         print(f"    [E2] crs2={src_e2.crs} → fallback {crs2}")
+                    elif hasattr(crs2, "to_string"):
+                        epsg = crs2.to_epsg()
+                        crs2 = f"EPSG:{epsg}" if epsg else crs2.to_string()
                     if W2 < 512 or H2 < 512:
                         print(f"    [E2] {tif.name}: {W2}x{H2} < 512, skip")
                         continue
+                    # GT для инференса не нужен — только TIF
                     data2 = src_e2.read()
                     if data2.shape[0] >= 4:
                         data2 = data2[:3]
@@ -413,8 +422,13 @@ def process_region(model, region_dir, tmp_root, region_name):
                             tile2 = img2[y2:y2+512, x2:x2+512]
                             if tile2.shape[0] < 512 or tile2.shape[1] < 512: continue
                             tile2_bgr = np.ascontiguousarray(cv2.cvtColor(tile2, cv2.COLOR_RGB2BGR))
-                            r2 = e2.predict(source=tile2_bgr, conf=0.4, iou=0.5, max_det=100, verbose=False)[0]
-                            if r2.masks is None or r2.boxes is None: continue
+                            r2 = e2.predict(source=tile2_bgr, conf=0.6, iou=0.5, max_det=50, verbose=False)[0]
+                            if r2.masks is None or r2.boxes is None:
+                                if os.environ.get("DEBUG_E2"):
+                                    print(f"    [E2] тайл ({y2},{x2}): masks=None или boxes=None")
+                                continue
+                            if os.environ.get("DEBUG_E2"):
+                                print(f"    [E2] тайл ({y2},{x2}): масок={len(r2.masks.data)}")
                             m2_data = r2.masks.data.cpu().numpy()
                             oh2, ow2 = r2.masks.orig_shape
                             c2 = r2.boxes.cls.cpu().numpy()
@@ -460,6 +474,8 @@ def process_region(model, region_dir, tmp_root, region_name):
                                             },
                                             "geometry": mapping(g_3857_2),
                                         })
+                                        if len(features) % 100 == 0:
+                                            print(f"    [E2] добавлено {len(features)} фич")
                                         # Проверка на NaN
                                         import math as _m
                                         _cs = json.dumps(features[-1]["geometry"]["coordinates"])
