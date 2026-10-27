@@ -30,6 +30,35 @@ CLASS_NAMES = ["kurgany_tselye", "kurgany_povrezhdennye", "fortifikatsii",
                "gorodishcha", "arkhitektury"]
 E2_CLASS_NAMES = ["finds_points", "object_poly"]
 _E2_MODEL = None  # global E2 model
+_E3_MODEL = None  # global E3 model (снимки: ae / sp_or / or)
+EXTRA_MODALITIES = ("or", "sp_or", "ae")
+DEFAULT_EXTRA_MODALITIES = ("or", "sp_or", "ae")
+
+def modality_of(path):
+    """Модальность растра по пути; None — если это готовый хиллшейд или не снимок."""
+    low = str(path).lower()
+    if any(mark in low for mark in ("lidar", "li_карт", "li_карты", "hillshade", "отмывк")):
+        return None
+    if "spor" in low or "sp_or" in low or "спутник" in low:
+        return "sp_or"
+    if "_or_" in low or "ортофото" in low:
+        return "or"
+    if "_ae_" in low or "немецк" in low or "luft" in low:
+        return "ae"
+    return None
+
+def find_extra_rasters(region_dir, modalities):
+    """Пары (растр, модальность) для не-лидарных снимков площадки."""
+    wanted = {m.lower() for m in modalities}
+    found = []
+    for path in sorted(region_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in (".tif", ".tiff"):
+            continue
+        modality = modality_of(path)
+        if modality and modality in wanted:
+            found.append((path, modality))
+    return found
+
 TILE = 1024
 OVERLAP = 0.3
 STRIDE = int(TILE * (1 - OVERLAP))
@@ -211,7 +240,7 @@ def hillshade_esri(dem, res_x, res_y, az=315.0, alt=45.0, zf=1.0):
     slope = np.arctan(np.hypot(gx, gy)*zf)
     aspect = np.arctan2(-gx, -gy)
     zen = math.radians(90.0-alt); azr = math.radians(az)
-    shade = 255.0*(math.cos(zen)*np.cos(slope)+math.sin(zen)*np.sin(slope)*np.cos(azr-aspect))
+    shade = 255.0*(math.cos(zen)*math.cos(slope)+math.sin(zen)*np.sin(slope)*np.cos(azr-aspect))
     return np.clip(shade, 0.0, 255.0)
 
 def build_g_from_las(las_path, out_dir, res=0.20):
@@ -270,6 +299,141 @@ def load_utm_epsg(region_dir):
         digits = "".join(ch for ch in utm if ch.isdigit())
         return (32600 if not utm.upper().endswith("S") else 32700) + int(digits)
     except Exception: return 32636
+
+
+def process_extra_raster(model, raster_path, modality, idx, total,
+                         region_crs, region_name, window_pixels=48_000_000):
+    """Не-лидарный снимок: чтение окнами 1024x1024 с overlap 30% (как E1)."""
+    from rasterio.windows import Window, transform as window_transform
+
+    features = []
+    try:
+        with rasterio.open(raster_path) as src:
+            width, height, bands = src.width, src.height, src.count
+            file_crs = src.crs.to_string() if src.crs else None
+            crs = region_crs or file_crs
+            # Режем на окна 2048x2048, внутри — тайлы 1024x1024 с overlap 30%
+            WIN = 2048
+            TILE_E3 = 1024
+            STRIDE_E3 = int(TILE_E3 * 0.7)
+            cols = math.ceil(width / WIN)
+            rows = math.ceil(height / WIN)
+            print(f"  [{region_name}] E3/{modality}: {raster_path.name} "
+                  f"({width}x{height}, {bands} band(s)), {cols}x{rows} окон")
+            for row in range(rows):
+                for col in range(cols):
+                    x, y = col * WIN, row * WIN
+                    w, h = min(WIN, width - x), min(WIN, height - y)
+                    window = Window(x, y, w, h)
+                    data = src.read(window=window)
+                    tf_win = window_transform(window, src.transform)
+                    # uint8 нормализация
+                    if data.dtype != np.uint8:
+                        dmin = float(data.min()); dmax = float(data.max())
+                        if dmax > dmin:
+                            data = (255.0 * (data.astype(np.float32) - dmin) / (dmax - dmin)).astype(np.uint8)
+                        else:
+                            data = np.zeros_like(data, dtype=np.uint8)
+                    # 1 канал → 3 (серый → RGB)
+                    if data.shape[0] == 1:
+                        data = np.repeat(data, 3, axis=0)
+                    elif data.shape[0] > 3:
+                        data = data[:3]
+                    img = data[:3].transpose(1, 2, 0)
+                    # CLAHE для grayscale/низкоконтрастных (ae)
+                    if modality in ("ae",) or bands == 1:
+                        try:
+                            lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+                            l, a, b = cv2.split(lab)
+                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                            l = clahe.apply(l)
+                            img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
+                        except Exception:
+                            pass
+                    # Режем на тайлы 1024 с overlap
+                    img_h, img_w = img.shape[:2]
+                    ys = list(range(0, max(1, img_h - TILE_E3 + 1), STRIDE_E3)) or [0]
+                    xs = list(range(0, max(1, img_w - TILE_E3 + 1), STRIDE_E3)) or [0]
+                    for ty in ys:
+                        for tx in xs:
+                            tile = img[ty:ty+TILE_E3, tx:tx+TILE_E3]
+                            if tile.shape[0] < TILE_E3 or tile.shape[1] < TILE_E3:
+                                continue
+                            tile_bgr = np.ascontiguousarray(cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
+                            try:
+                                r = model.predict(source=tile_bgr, conf=0.05, iou=0.5,
+                                                  verbose=False)[0]
+                            except Exception as e:
+                                print(f"    predict err: {e}"); continue
+                            if r.masks is None or r.boxes is None:
+                                continue
+                            m_data = r.masks.data.cpu().numpy()
+                            oh, ow = r.masks.orig_shape
+                            c_arr = r.boxes.cls.cpu().numpy()
+                            cf_arr = r.boxes.conf.cpu().numpy()
+                            t_utm_3857 = Transformer.from_crs(crs, 3857, always_xy=True)
+                            tile_tf = rasterio.windows.transform(
+                                Window(tx, ty, TILE_E3, TILE_E3), tf_win)
+                            for i, raw in enumerate(m_data):
+                                m = raw
+                                if m.shape != (oh, ow):
+                                    m = cv2.resize(m, (ow, oh), interpolation=cv2.INTER_NEAREST)
+                                binm = m > MASK_THRESHOLD
+                                if not binm[:TILE_E3, :TILE_E3].any():
+                                    continue
+                                full = np.zeros((TILE_E3, TILE_E3), np.uint8)
+                                full[:min(oh, TILE_E3), :min(ow, TILE_E3)] = binm[:TILE_E3, :TILE_E3].astype(np.uint8)
+                                cid = int(c_arr[i]) if i < len(c_arr) else 0
+                                cnames = model.names if hasattr(model, "names") else CLASS_NAMES
+                                if isinstance(cnames, list):
+                                    cnames = {j: n for j, n in enumerate(cnames)}
+                                if cid not in cnames:
+                                    continue
+                                cname = cnames[cid]
+                                cconf = float(cf_arr[i]) if i < len(cf_arr) else 0.5
+                                for poly in mask_to_polygons(full):
+                                    try:
+                                        g_utm = shp_transform(lambda px, py, z=None: (
+                                            tile_tf.c + px*tile_tf.a + py*tile_tf.b,
+                                            tile_tf.f + px*tile_tf.d + py*tile_tf.e), poly)
+                                        g_3857 = shp_transform(t_utm_3857.transform, g_utm)
+                                        g_3857 = make_valid(g_3857)
+                                        if g_3857.is_empty:
+                                            continue
+                                        if g_3857.geom_type not in ("Polygon", "MultiPolygon"):
+                                            parts = [gg for gg in g_3857.geoms
+                                                     if gg.geom_type in ("Polygon", "MultiPolygon")]
+                                            if not parts:
+                                                continue
+                                            g_3857 = unary_union(parts)
+                                        g_3857 = g_3857.simplify(SIMPLIFY_TOLERANCE_M, preserve_topology=True)
+                                        if g_3857.is_empty:
+                                            continue
+                                        if abs(g_utm.area) < MIN_AREA_M2:
+                                            continue
+                                        geom_json = mapping(g_3857)
+                                        coords_str = json.dumps(geom_json["coordinates"])
+                                        if "NaN" in coords_str or "Infinity" in coords_str:
+                                            continue
+                                        features.append({
+                                            "type": "Feature",
+                                            "properties": {
+                                                "class_name": cname,
+                                                "region_name": region_name,
+                                                "markup_type": modality,
+                                                "crs": "urn:ogc:def:crs:EPSG::3857",
+                                                "original_crs": crs,
+                                                "confidence": round(cconf, 3),
+                                                "fid": 0,
+                                            },
+                                            "geometry": geom_json,
+                                        })
+                                    except Exception:
+                                        continue
+    except Exception as e:
+        print(f"  [{region_name}] E3 {raster_path.name}: {e}")
+    print(f"  [{region_name}] E3/{modality}: +{len(features)} фич")
+    return features
 
 def process_region(model, region_dir, tmp_root, region_name):
     las = find_las(region_dir)
@@ -487,13 +651,27 @@ def process_region(model, region_dir, tmp_root, region_name):
             except Exception as e:
                 print(f"  [{region_name}] E2 {tif.name}: {e}")
 
+
+    # ===== E3 (снимки: ae / sp_or / or) =====
+    if _E3_MODEL is not None:
+        extra_rasters = find_extra_rasters(region_dir, DEFAULT_EXTRA_MODALITIES)
+        if extra_rasters:
+            print(f"  [{region_name}] E3: {len(extra_rasters)} снимков")
+            for idx, (raster_path, modality) in enumerate(extra_rasters, 1):
+                try:
+                    feats3 = process_extra_raster(_E3_MODEL, raster_path, modality, idx,
+                                                  len(extra_rasters), None, region_name)
+                    features.extend(feats3)
+                except Exception as e:
+                    print(f"  [{region_name}] E3 {raster_path.name}: {e}")
+
     print(f"  [{region_name}] тайлов E1: {n_tiles}, фич всего: {len(features)}")
     return features
 
 def dedup(features, thr=DEDUP_IOU):
     groups = defaultdict(list)
     for f in features:
-        groups[f["properties"]["class_name"]].append(f)
+        groups[(f["properties"]["class_name"], f["properties"].get("markup_type", ""))].append(f)
     out = []
     for items in groups.values():
         uniq = []
@@ -543,6 +721,18 @@ def main():
             print(f"E2 не загружен: {e}")
     else:
         print(f"⚠️ E2 не найден: {e2_path}")
+    global _E3_MODEL
+    e3_path = Path(__file__).parent / "best_e3.pt"
+    if e3_path.exists():
+        print(f"Загрузка E3: {e3_path}")
+        try:
+            _E3_MODEL = YOLO(str(e3_path))
+            print(f"E3 classes: {_E3_MODEL.names}")
+        except Exception as e:
+            print(f"E3 не загружен: {e}")
+    else:
+        print(f"⚠️ E3 не найден: {e3_path}")
+
 
 
     regions = sorted(d for d in input_path.iterdir() if d.is_dir() and not d.name.startswith("."))
